@@ -1,0 +1,123 @@
+name: sync-upstream
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: router-for-me/CLIProxyAPI
+  UPSTREAM_BRANCH: main
+  FORK_BRANCH: main
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/cliproxyapi
+
+jobs:
+  sync:
+    name: Merge upstream/main into fork/main
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.FORK_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync from upstream
+        id: sync
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch upstream "${UPSTREAM_BRANCH}"
+          before="$(git rev-parse HEAD)"
+          upstream_head="$(git rev-parse upstream/${UPSTREAM_BRANCH})"
+          echo "fork_before=${before}"
+          echo "upstream_head=${upstream_head}"
+          if git merge-base --is-ancestor "${upstream_head}" HEAD; then
+            echo "Fork already contains upstream/${UPSTREAM_BRANCH}."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            git merge --no-edit "upstream/${UPSTREAM_BRANCH}"
+            after="$(git rev-parse HEAD)"
+            echo "fork_after=${after}"
+            git push origin "HEAD:${FORK_BRANCH}"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Refresh models catalog
+        run: |
+          set -euo pipefail
+          git fetch --depth 1 https://github.com/router-for-me/models.git main
+          git show FETCH_HEAD:models.json > internal/registry/models/models.json
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests
+        run: |
+          set -euo pipefail
+          go test ./...
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Generate build metadata
+        run: |
+          set -euo pipefail
+          echo "VERSION=$(git describe --tags --always --dirty)" >> "$GITHUB_ENV"
+          echo "COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
+      - name: Build image after sync
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          build-args: |
+            VERSION=${{ env.VERSION }}
+            COMMIT=${{ env.COMMIT }}
+            BUILD_DATE=${{ env.BUILD_DATE }}
+          tags: |
+            cliproxyapi:sync-test
+
+      - name: Smoke test image
+        run: |
+          set -euo pipefail
+          docker images cliproxyapi:sync-test --format 'image={{.Repository}}:{{.Tag}} id={{.ID}} size={{.Size}}'
+          docker run --rm cliproxyapi:sync-test ./CLIProxyAPI -h | head -n 40
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push GHCR image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            VERSION=${{ env.VERSION }}
+            COMMIT=${{ env.COMMIT }}
+            BUILD_DATE=${{ env.BUILD_DATE }}
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ env.COMMIT }}
